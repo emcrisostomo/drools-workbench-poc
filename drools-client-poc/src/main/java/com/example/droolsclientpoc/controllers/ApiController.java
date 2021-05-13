@@ -1,5 +1,6 @@
 package com.example.droolsclientpoc.controllers;
 
+import com.example.droolsclientpoc.dtos.Permiso;
 import org.kie.api.KieServices;
 import org.kie.api.command.BatchExecutionCommand;
 import org.kie.api.command.Command;
@@ -14,15 +15,14 @@ import org.kie.server.client.KieServicesClient;
 import org.kie.server.client.KieServicesConfiguration;
 import org.kie.server.client.KieServicesFactory;
 import org.kie.server.client.RuleServicesClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import javax.annotation.PostConstruct;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 
 @RestController
 public class ApiController
@@ -30,8 +30,10 @@ public class ApiController
     private static final String URL = "http://docker:8180/kie-server/services/rest/server";
     private static final String USER = "kieserver";
     private static final String PASSWORD = "kieserver1!";
-    
+    private static final Logger logger = LoggerFactory.getLogger(ApiController.class);
+
     private KieServicesClient kieServicesClient;
+    private boolean usePermissionClass;
 
     @PostConstruct
     private void initialize()
@@ -39,55 +41,72 @@ public class ApiController
         KieServicesConfiguration conf = KieServicesFactory.newRestConfiguration(URL, USER, PASSWORD);
         conf.setMarshallingFormat(MarshallingFormat.JSON);
 
+        if (usePermissionClass)
+        {
+            Set<Class<?>> extraClasses = new HashSet<>();
+            extraClasses.add(Permiso.class);
+            conf.addExtraClasses(extraClasses);
+        }
+
         kieServicesClient = KieServicesFactory.newKieServicesClient(conf);
     }
 
     @GetMapping("/rules")
     public ResponseEntity<String> rules()
     {
+        final Optional<String> containerId = getFirstContainerId();
 
-        List<KieContainerResource> kieContainers = kieServicesClient.listContainers().getResult().getContainers();
-        if (kieContainers.isEmpty())
-        {
-            System.out.println("No containers available...");
+        if (containerId.isEmpty())
             return ResponseEntity.notFound().build();
-        }
-
-        for (KieContainerResource kr : kieContainers)
-            System.out.printf("Container id: %s%n", kr.getContainerId());
-
-        final String containerId = kieContainers.get(0).getContainerId();
 
         RuleServicesClient rulesClient = kieServicesClient.getServicesClient(RuleServicesClient.class);
         KieCommands commandsFactory = KieServices.Factory.get().getCommands();
 
-        final String obj = "test";
-        final String uuid = UUID.randomUUID().toString();
+        final Object fact = buildFact();
+        final var uuid = UUID.randomUUID().toString();
 
-        Command<?> insert = commandsFactory.newInsert(obj, uuid);
+        Command<?> insert = commandsFactory.newInsert(fact, uuid);
         Command<?> fireAllRules = commandsFactory.newFireAllRules();
         Command<?> batchCommand = commandsFactory.newBatchExecution(Arrays.asList(insert, fireAllRules));
 
-        ServiceResponse<ExecutionResults> executeResponse = rulesClient.executeCommandsWithResults(containerId, batchCommand);
+        ServiceResponse<ExecutionResults> executeResponse = rulesClient.executeCommandsWithResults(containerId.get(), batchCommand);
 
         if (executeResponse.getType() != KieServiceResponse.ResponseType.SUCCESS)
         {
-            System.out.println("Error executing rules. Message: ");
-            System.out.println(executeResponse.getMsg());
-
+            logger.error("Error executing rules. Message: {}", executeResponse.getMsg());
             return ResponseEntity.badRequest().build();
         }
 
-        System.out.println("Commands executed with success! Response: ");
-        System.out.println(executeResponse.getResult().toString());
+        logger.info("Commands executed with success! Response: {}", executeResponse.getResult());
 
-        FactHandle factHandle = (FactHandle) executeResponse.getResult().getFactHandle(uuid);
-        Object value = executeResponse.getResult().getValue(uuid);
+        final var factHandle = (FactHandle) executeResponse.getResult().getFactHandle(uuid);
+        final Object value = executeResponse.getResult().getValue(uuid);
 
-        return deleteFactFromSession(containerId, factHandle)
+        logger.debug("Fact retrieved from handle: {}", value);
+
+        return deleteFactFromSession(containerId.get(), factHandle)
                 ? ResponseEntity.ok("ok")
                 : ResponseEntity.badRequest().build();
+    }
 
+    private Optional<String> getFirstContainerId()
+    {
+        final List<KieContainerResource> kieContainers = kieServicesClient.listContainers().getResult().getContainers();
+        if (kieContainers.isEmpty())
+        {
+            logger.error("No containers available...");
+            return Optional.empty();
+        }
+
+        for (KieContainerResource kr : kieContainers)
+            logger.info("Container id: {}", kr.getContainerId());
+
+        return Optional.ofNullable(kieContainers.get(0).getContainerId());
+    }
+
+    private Object buildFact()
+    {
+        return usePermissionClass ? new Permiso(1) : "staticFact";
     }
 
     private boolean deleteFactFromSession(String containerId, FactHandle factHandle)
@@ -102,11 +121,9 @@ public class ApiController
         ServiceResponse<ExecutionResults> deleteResult = rulesClient.executeCommandsWithResults(containerId, deleteBatch);
 
         if (deleteResult.getType() == KieServiceResponse.ResponseType.SUCCESS)
-        {
             return true;
-        }
 
-        System.err.println("Error deleting fact: " + deleteResult.getMsg());
+        logger.error("Error deleting fact: {}", deleteResult.getMsg());
         return false;
     }
 }
